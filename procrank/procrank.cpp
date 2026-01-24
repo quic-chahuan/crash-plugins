@@ -90,10 +90,6 @@ void Procrank::init_command(void){
 
 void Procrank::parser_process_memory() {
     LOGI("Start parsing process memory\n");
-    if (!swap_ptr->is_zram_enable()) {
-        LOGW("ZRAM not enabled, returning\n");
-        return;
-    }
     uint64_t total_vss = 0, total_rss = 0, total_pss = 0, total_uss = 0, total_swap = 0;
     if (procrank_list.empty()) {
         LOGI("Procrank list empty, parsing all processes\n");
