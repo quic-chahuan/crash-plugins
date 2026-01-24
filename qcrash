@@ -10,49 +10,969 @@
 # GNU General Public License for more details.
 #
 # SPDX-License-Identifier: GPL-2.0-only
+
 #!/bin/bash
 
+# ==============================================================================
+# Logging Functions
+# ==============================================================================
+log_info() {
+    echo -e "\033[32m[INFO] $1\033[0m"
+}
+
+log_warn() {
+    echo -e "\033[33m[WARN] $1\033[0m" >&2
+}
+
+log_error() {
+    echo -e "\033[31m[ERROR] $1\033[0m" >&2
+}
+
+# ==============================================================================
+# Python Logic (Embedded)
+# ==============================================================================
+
+# Calculate VA bits from vmlinux
+calculate_va_bits() {
+    local vmlinux_path="$1"
+    local temp_python_script=$(mktemp /tmp/va_bits_calc_XXXXXX.py)
+
+    cat <<'EOF' > "$temp_python_script"
+#!/usr/bin/env python3
+"""
+VA Bits Calculator
+Extract and calculate VA bits from vmlinux kernel configuration.
+"""
+
+import sys
+import os
+import mmap
+import gzip
+import lzma
+import bz2
+import io
+import re
+from typing import Dict
+
+# --- IKCONFIG Constants ---
+MAGIC_START = b"IKCFG_ST"
+MAGIC_END   = b"IKCFG_ED"
+GZIP_HDR    = b"\x1f\x8b"
+XZ_HDR      = b"\xfd7zXZ\x00"
+BZ2_HDR     = b"BZh"
+
+def slice_ikconfig_blob(vmlinux_bytes: bytes) -> bytes:
+    """
+    Locate the IKCONFIG start/end markers in the kernel image bytes and slice out the payload.
+    Returns only the content between MAGIC_START and MAGIC_END (excluding the markers themselves).
+    """
+    s = vmlinux_bytes.find(MAGIC_START)
+    if s < 0:
+        raise RuntimeError("IKCFG_ST not found; CONFIG_IKCONFIG might not be enabled or vmlinux is stripped.")
+    e = vmlinux_bytes.find(MAGIC_END, s)
+    if e < 0:
+        # If no end marker, handle conservatively: cannot safely slice.
+        raise RuntimeError("Found IKCFG_ST but not IKCFG_ED, cannot safely slice.")
+    payload = vmlinux_bytes[s + len(MAGIC_START): e]
+    return payload
+
+def try_decompress(cfg_blob: bytes) -> bytes:
+    """
+    Try to decompress using common formats: gzip -> xz -> bzip2 -> plain text.
+    Raises error if all fail and it doesn't look like text.
+    """
+    # gzip
+    gz_off = cfg_blob.find(GZIP_HDR)
+    if gz_off >= 0:
+        with gzip.GzipFile(fileobj=io.BytesIO(cfg_blob[gz_off:])) as gz:
+            return gz.read()
+
+    # xz
+    xz_off = cfg_blob.find(XZ_HDR)
+    if xz_off >= 0:
+        with lzma.LZMAFile(io.BytesIO(cfg_blob[xz_off:])) as xz:
+            return xz.read()
+
+    # bzip2
+    bz2_off = cfg_blob.find(BZ2_HDR)
+    if bz2_off >= 0:
+        return bz2.decompress(cfg_blob[bz2_off:])
+
+    # Plain text attempt
+    head = cfg_blob[:4096].decode("utf-8", errors="ignore")
+    if "CONFIG_" in head or head.lstrip().startswith("#"):
+        return cfg_blob  # Looks like plain text .config
+
+    raise RuntimeError("No gzip/xz/bz2 header detected, and does not look like valid plain text .config.")
+
+def parse_kconfig_text(cfg_text: str) -> Dict[str, str]:
+    """
+    Parse .config text into a key-value dictionary (ignoring comment lines and lines without '=').
+    """
+    kv: Dict[str, str] = {}
+    for line in cfg_text.splitlines():
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        kv[k.strip()] = v.strip()
+    return kv
+
+def derive_va_bits_arm64(kv: Dict[str, str]) -> int:
+    """
+    Derive VA bits from arm64 configuration items.
+    Returns the effective VA bits integer.
+    """
+    # 1) Explicit value priority: CONFIG_ARM64_VA_BITS=<N>
+    if "CONFIG_ARM64_VA_BITS" in kv:
+        try:
+            return int(kv["CONFIG_ARM64_VA_BITS"])
+        except Exception:
+            pass
+
+    # 2) Check *_<digits>=y
+    suffix_candidates = []
+    pat = re.compile(r"^CONFIG_ARM64_VA_BITS_(\d+)$")
+    # Optimization: iterate all keys (usually not large)
+    for k, v in kv.items():
+        m = pat.match(k)
+        if m and v == "y":
+            try:
+                suffix_candidates.append(int(m.group(1)))
+            except ValueError:
+                pass
+
+    if suffix_candidates:
+        return max(suffix_candidates)  # Conservative strategy: take max if multiple found
+
+    # 3) Fallback for legacy notation: CONFIG_ARM64_VA_BITS_52 / _48
+    if kv.get("CONFIG_ARM64_VA_BITS_52") == "y":
+        return 52
+    elif kv.get("CONFIG_ARM64_VA_BITS_48") == "y":
+        return 48
+
+    return 39 # Default fallback for ARM64 if nothing found
+
+def get_kernel_va_bits(vmlinux_path: str) -> int:
+    """
+    Extract .config from vmlinux and derive VA bits.
+    Returns 39 by default if failed.
+    Uses mmap to optimize memory usage.
+    """
+    default_va_bits = 39
+
+    try:
+        if not os.path.exists(vmlinux_path):
+            return default_va_bits
+
+        with open(vmlinux_path, "rb") as f:
+            # Use mmap to map the file, avoiding reading the entire large file into memory
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                try:
+                    blob = slice_ikconfig_blob(mm)
+                    cfg_bytes = try_decompress(blob)
+                    cfg_text = cfg_bytes.decode("utf-8", errors="ignore")
+                except Exception as e:
+                    sys.stderr.write(f"[WARN] Failed to extract/decompress .config ({e}), using default va_bits: {default_va_bits}\n")
+                    return default_va_bits
+
+        kv = parse_kconfig_text(cfg_text)
+        va_bits = derive_va_bits_arm64(kv)
+
+        if va_bits is None:
+             sys.stderr.write(f"Failed to derive valid VA bits, using default: {default_va_bits}\n")
+             return default_va_bits
+
+        sys.stderr.write(f"Detected VA bits: {va_bits}\n")
+        return va_bits
+
+    except Exception as e:
+        sys.stderr.write(f"Exception in get_kernel_va_bits ({e}), using default va_bits: {default_va_bits}\n")
+        return default_va_bits
+
+def main():
+    if len(sys.argv) != 2:
+        sys.stderr.write("Usage: va_bits_calculator.py <vmlinux>\n")
+        sys.exit(1)
+
+    vmlinux = sys.argv[1]
+
+    if not os.path.exists(vmlinux):
+        sys.stderr.write(f"Error: vmlinux not found: {vmlinux}\n")
+        sys.exit(1)
+
+    try:
+        va_bits = get_kernel_va_bits(vmlinux)
+        print(f"{va_bits}")
+    except Exception as e:
+        sys.stderr.write(f"Error: {e}\n")
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
+EOF
+
+    # Run the temporary Python script
+    python3 "${temp_python_script}" "${vmlinux_path}" 2>&1
+    local ret=$?
+    rm -f "${temp_python_script}"
+    return $ret
+}
+
+calculate_kaslr_python() {
+    local vmlinux_path="$1"
+    local dump_dir_path="$2"
+    local known_kaslr="$3"  # Optional third parameter
+    local temp_python_script=$(mktemp /tmp/kaslr_calc_XXXXXX.py)
+
+    cat <<'EOF' > "$temp_python_script"
+#!/usr/bin/env python3
+"""
+KASLR Offset Calculator
+Calculate kaslr_offset and kimage_voffset and va_bits.
+"""
+
+import sys
+import os
+import struct
+import subprocess
+import re
+import threading
+import time
+import mmap
+import gzip
+import lzma
+import bz2
+import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Tuple, Optional
+
+
+def parse_vmlinux_symbols(vmlinux_path: str) -> Dict[str, int]:
+    """
+    Parse vmlinux symbol table using 'nm -n'.
+
+    Returns: {
+        'kimage_voffset': addr,
+        'kimage_vaddr': addr,
+        '_text': addr,
+        'linux_banner': addr
+    }
+    """
+    symbols = {}
+    required_symbols = ['kimage_voffset', 'kimage_vaddr', '_text', 'linux_banner']
+
+    try:
+        cmd = ['nm', '-n', vmlinux_path]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    addr = int(parts[0], 16)
+                    name = parts[-1]
+
+                    if name in required_symbols:
+                        symbols[name] = addr
+                except (ValueError, IndexError):
+                    continue
+
+        # Check if all required symbols are found
+        missing = [s for s in required_symbols if s not in symbols]
+        if missing:
+            sys.stderr.write(f"Warning: Missing symbols: {missing}\n")
+
+        return symbols
+
+    except subprocess.CalledProcessError as e:
+        sys.stderr.write(f"Error running readelf: {e}\n")
+        return {}
+    except Exception as e:
+        sys.stderr.write(f"Error parsing symbols: {e}\n")
+        return {}
+
+
+def get_linux_banner_from_vmlinux(vmlinux_path: str) -> Optional[str]:
+    """
+    Extract linux_banner from vmlinux using 'strings' command.
+    """
+    try:
+        cmd = ['strings', vmlinux_path]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+        for line in result.stdout.splitlines():
+            if line.startswith('Linux version'):
+                return line
+
+        return None
+
+    except subprocess.CalledProcessError as e:
+        sys.stderr.write(f"Error running strings: {e}\n")
+        return None
+    except Exception as e:
+        sys.stderr.write(f"Error getting linux_banner: {e}\n")
+        return None
+
+
+def is_ramdump_file(filename):
+    """
+    Check if the filename indicates a RAM dump file.
+    """
+    ddr = re.compile(r'(DDR)[0-9_CS]+[.]BIN', re.IGNORECASE)
+    # imem = re.compile(r'.*IMEM.BIN', re.IGNORECASE) # Skip IMEM for now
+    if ddr.match(filename):
+        return True
+    return False
+
+
+def parse_dump_info(dump_dir: str) -> Tuple[List[Tuple[str, int, int]], int]:
+    """
+    Parse dump_info.txt to get DDR file information.
+
+    Returns: (ddr_files, phys_offset)
+        ddr_files: [(file_path, start_addr, size), ...]
+        phys_offset: The start address of the first DDR file.
+    """
+    ddr_files = []
+    filename = 'dump_info.txt'
+    dump_info_path = os.path.join(dump_dir, filename)
+
+    if not os.path.exists(dump_info_path):
+        sys.stderr.write(f'!!! AutoParse could not find {filename}!\n')
+        raise Exception(f"{filename} not found")
+
+    with open(dump_info_path, 'r') as f:
+        try:
+            for line in f.readlines():
+                if 'Exception CreateMemDebugFile during memory dump' in line:
+                    sys.stderr.write('!!! QPST encountered errors while collecting the dump.\n')
+                    sys.exit(1)
+
+                words = line.split()
+                if not words or not is_ramdump_file(words[-1]):
+                    continue
+
+                fname = words[-1]
+                start = int(words[1], 16)
+                size = int(words[2])
+
+                fullpath = os.path.join(dump_dir, fname)
+                if not os.path.exists(fullpath):
+                    sys.stderr.write(f"File {fullpath} does not exist, skipping...\n")
+                    continue
+
+                filesize = os.path.getsize(fullpath)
+                if size != filesize:
+                    sys.stderr.write(
+                        ("!!! Size of %s on disk (%d) doesn't match size " +
+                         "from dump_info.txt (%d). Skipping...\n")
+                        % (fname, filesize, size))
+                    continue
+
+                ddr_files.append((fullpath, start, size))
+
+        except SystemExit:
+            sys.exit(1)
+        except Exception as e:
+            sys.stderr.write(f'!!! Cannot parse {filename} due to improper format! Error: {e}\n')
+            raise
+
+    if not ddr_files:
+        raise Exception("No DDR files found in dump directory")
+
+    # Sort by start address
+    ddr_files.sort(key=lambda x: x[1])
+
+    # phys_offset is the start address of the first DDR file
+    phys_offset = ddr_files[0][1]
+
+    return ddr_files, phys_offset
+
+
+def read_physical_memory(ddr_files: List[Tuple], phys_addr: int, length: int) -> Optional[bytes]:
+    """
+    Read data from specific physical address in DDR files.
+
+    Args:
+        ddr_files: Can be [(file_path, start_addr, size), ...] or [(mmap_obj, start_addr, size), ...]
+    """
+    for item, start_addr, size in ddr_files:
+        end_addr = start_addr + size
+        if start_addr <= phys_addr < end_addr:
+            offset = phys_addr - start_addr
+            try:
+                # Check if it is an mmap object
+                if isinstance(item, mmap.mmap):
+                    # Use mmap for direct reading (zero-copy, high performance)
+                    return item[offset:offset+length]
+                else:
+                    # Fallback to file reading (compatibility)
+                    with open(item, 'rb') as f:
+                        f.seek(offset)
+                        return f.read(length)
+            except Exception as e:
+                sys.stderr.write(f"Error reading from memory: {e}\n")
+                return None
+
+    return None
+
+
+def read_u64(ddr_files: List[Tuple[str, int, int]], phys_addr: int) -> Optional[int]:
+    """
+    Read an 8-byte unsigned integer (little-endian) from DDR files.
+    """
+    data = read_physical_memory(ddr_files, phys_addr, 8)
+    if data and len(data) == 8:
+        return struct.unpack('<Q', data)[0]
+    return None
+
+
+def read_cstring(ddr_files: List[Tuple[str, int, int]], phys_addr: int, max_length: int = 200) -> Optional[str]:
+    """
+    Read a C-style string (null-terminated) from DDR files.
+    """
+    data = read_physical_memory(ddr_files, phys_addr, max_length)
+    if data:
+        try:
+            # Decode as ASCII, ignore errors
+            text = data.decode('ascii', errors='ignore')
+            # Truncate at the first null character
+            return text.split('\0')[0]
+        except:
+            return None
+    return None
+
+
+def calculate_via_kimage_voffset(symbols: Dict[str, int], ddr_files: List[Tuple[str, int, int]],
+                                  phys_offset: int) -> Optional[Tuple[int, int]]:
+    """
+    Calculate kaslr_offset using the 'kimage_voffset' variable.
+
+    Calculate kaslr_offset through kimage_voffset:
+    1. Read the compile-time address of kimage_voffset
+    2. Read the kernel image start compile-time address = _text compile-time address
+    3. Calculate kimage_voffset offset = kimage_voffset compile-time address - kernel image start compile-time address
+    4. Calculate kimage_voffset physical address = kimage_voffset offset + phys_offset
+    5. Read kimage_voffset physical address to get kimage_voffset value
+    6. Calculate kimage_voffset virtual address = kimage_voffset physical address + kimage_voffset value
+    7. Calculate kaslr_offset = kimage_voffset virtual address - kimage_voffset compile-time address
+
+    Returns: (kaslr_offset, kimage_voffset) or None
+    """
+    if 'kimage_voffset' not in symbols or '_text' not in symbols:
+        return None
+
+    # Step 1: Get compile-time addresses from symbol table
+    kimage_voffset_var_compile_addr = symbols['kimage_voffset']  # kimage_voffset variable compile-time address
+    kernel_image_compile_start_addr = symbols['_text']          # kernel image compile-time start address
+
+    # Step 2: Calculate physical address of kimage_voffset variable
+    # Formula: variable physical address = kernel physical start address + (variable compile address - kernel compile start address)
+    kimage_voffset_var_physical_addr = phys_offset + kimage_voffset_var_compile_addr - kernel_image_compile_start_addr
+
+    # Step 3: Read the actual value stored in kimage_voffset variable from memory
+    kimage_voffset_value = read_u64(ddr_files, kimage_voffset_var_physical_addr)
+    if kimage_voffset_value is None:
+        return None
+
+    # Step 4: Calculate runtime virtual address of kimage_voffset variable (with KASLR applied)
+    # Formula: variable runtime virtual address = variable physical address + kimage_voffset value
+    kimage_voffset_var_runtime_addr = kimage_voffset_var_physical_addr + kimage_voffset_value
+
+    # Step 5: Calculate KASLR offset
+    # Formula: KASLR offset = variable runtime address - variable compile-time address
+    if kimage_voffset_var_runtime_addr >= kimage_voffset_var_compile_addr:
+        kaslr_offset = kimage_voffset_var_runtime_addr - kimage_voffset_var_compile_addr
+        return (kaslr_offset, kimage_voffset_value)
+    else:
+        return None
+
+
+def calculate_via_kimage_vaddr(symbols: Dict[str, int], ddr_files: List[Tuple[str, int, int]],
+                                phys_offset: int) -> Optional[Tuple[int, int]]:
+    """
+    Calculate kaslr_offset using the 'kimage_vaddr' variable.
+
+    Calculate kaslr_offset through kimage_vaddr:
+    1. Read the compile-time address of kimage_vaddr
+    2. Read the kernel image start compile-time address = _text compile-time address
+    3. Calculate kimage_vaddr offset = kimage_voffset compile-time address - kernel image start compile-time address
+    4. Calculate kimage_vaddr physical address = kimage_vaddr offset + phys_offset
+    5. Read kimage_vaddr physical address to get kimage_vaddr value
+    6. Calculate kaslr_offset = kimage_vaddr value - kernel image start compile-time address
+    7. Calculate kimage_voffset = kimage_vaddr value - phys_offset
+
+    Returns: (kaslr_offset, kimage_voffset) or None
+    """
+    if 'kimage_vaddr' not in symbols or '_text' not in symbols:
+        return None
+
+    # Step 1: Get compile-time addresses from symbol table
+    kimage_vaddr_var_compile_addr = symbols['kimage_vaddr']  # kimage_vaddr variable compile-time address
+    kernel_image_compile_start_addr = symbols['_text']      # kernel image compile-time start address
+
+    # Step 2: Calculate physical address of kimage_vaddr variable
+    # Formula: variable physical address = kernel physical start address + (variable compile address - kernel compile start address)
+    kimage_vaddr_var_physical_addr = phys_offset + kimage_vaddr_var_compile_addr - kernel_image_compile_start_addr
+
+    # Step 3: Read the actual value stored in kimage_vaddr variable from memory
+    # Note: kimage_vaddr variable stores the kernel image runtime start virtual address
+    kernel_image_runtime_start_addr = read_u64(ddr_files, kimage_vaddr_var_physical_addr)
+    if kernel_image_runtime_start_addr is None:
+        return None
+
+    # Step 4: Validate if the read value is reasonable
+    if kernel_image_runtime_start_addr >= kernel_image_compile_start_addr:
+        # Step 5: Calculate KASLR offset
+        # Formula: KASLR offset = kernel runtime start address - kernel compile-time start address
+        kaslr_offset = kernel_image_runtime_start_addr - kernel_image_compile_start_addr
+
+        # Step 6: Calculate kimage_voffset
+        # Formula: kimage_voffset = kernel runtime start address - kernel physical start address
+        kimage_voffset = kernel_image_runtime_start_addr - phys_offset
+
+        return (kaslr_offset, kimage_voffset)
+    else:
+        return None
+
+
+def validate_kaslr_result(symbols: Dict[str, int], ddr_files: List[Tuple[str, int, int]],
+                          kaslr_offset: int, kimage_voffset: int, linux_banner: str) -> Tuple[bool, str]:
+    """
+    Two-step validation:
+    1. linux_banner runtime address = linux_banner compile address + kaslr_offset
+    2. linux_banner physical address = linux_banner runtime address - kimage_voffset
+    3. Read linux_banner physical address to get linux_banner value
+    4. Read linux_banner from vmlinux
+    5. Check if they are equal
+
+    Args:
+        linux_banner: Pre-extracted linux_banner from vmlinux (cached).
+
+    Returns: (success, message)
+    """
+    # Step 1: Validate kimage_voffset variable
+    if 'kimage_voffset' in symbols:
+        kimage_voffset_var_addr = symbols['kimage_voffset']
+        kimage_voffset_var_phys = kimage_voffset_var_addr + kaslr_offset - kimage_voffset
+        kimage_voffset_var_value = read_u64(ddr_files, kimage_voffset_var_phys)
+
+        if kimage_voffset_var_value != kimage_voffset:
+            return False, f"kimage_voffset variable mismatch: expected 0x{kimage_voffset:x}, got 0x{kimage_voffset_var_value:x}"
+
+    # Step 2: Validate linux_banner
+    if 'linux_banner' not in symbols:
+        return False, "linux_banner symbol not found"
+
+    # 2.1 linux_banner runtime address = compile address + kaslr_offset
+    linux_banner_compile_addr = symbols['linux_banner']
+    linux_banner_runtime_addr = linux_banner_compile_addr + kaslr_offset
+
+    # 2.2 linux_banner physical address = runtime address - kimage_voffset
+    linux_banner_phys_addr = linux_banner_runtime_addr - kimage_voffset
+
+    # 2.3 Read linux_banner from DDR
+    banner_from_ddr = read_cstring(ddr_files, linux_banner_phys_addr, len(linux_banner))
+
+    # 2.4 Compare (using cached linux_banner)
+    if not banner_from_ddr or not linux_banner:
+        return False, "Failed to read linux_banner"
+
+    if linux_banner in banner_from_ddr:
+        return True, "All validations passed"
+    else:
+        return False, f"linux_banner mismatch:\n  DDR: {banner_from_ddr}\n  vmlinux: {linux_banner}"
+
+
+def try_phys_offset(symbols: Dict[str, int], ddr_files: List[Tuple[str, int, int]],
+                    phys_offset: int, linux_banner: str, known_kaslr_offset: Optional[int] = None,
+                    verbose: bool = False) -> Optional[Tuple[int, int, int]]:
+    """
+    Try a given phys_offset, calculate and validate kaslr_offset and kimage_voffset.
+
+    Args:
+        symbols: Symbol table from vmlinux
+        ddr_files: DDR file information
+        phys_offset: Physical offset to try
+        linux_banner: Pre-extracted linux_banner from vmlinux (cached)
+        known_kaslr_offset: Optional known KASLR offset from traditional method
+        verbose: Whether to print verbose error messages
+
+    Returns: (kaslr_offset, kimage_voffset, phys_offset) or None
+    """
+    if known_kaslr_offset is not None:
+        # Use simplified calculation with known KASLR offset
+        try:
+            kimage_voffset = calculate_kimage_voffset_from_kaslr(symbols, known_kaslr_offset, phys_offset)
+            kaslr_offset = known_kaslr_offset
+        except Exception as e:
+            if verbose:
+                sys.stderr.write(f"Simplified calculation failed: {e}\n")
+            return None
+    else:
+        # Use complex calculation methods
+        result = calculate_via_kimage_voffset(symbols, ddr_files, phys_offset)
+        if not result:
+            # Fallback to Method 2: via kimage_vaddr
+            result = calculate_via_kimage_vaddr(symbols, ddr_files, phys_offset)
+
+        if not result:
+            return None
+
+        kaslr_offset, kimage_voffset = result
+
+    # Validate results
+    success, message = validate_kaslr_result(symbols, ddr_files, kaslr_offset, kimage_voffset, linux_banner)
+
+    if success:
+        return (kaslr_offset, kimage_voffset, phys_offset)
+    else:
+        if verbose:
+            sys.stderr.write(f"Validation failed: {message}\n")
+        return None
+
+
+def traverse_ddr_file(file_info: Tuple[str, int, int], symbols: Dict[str, int],
+                      ddr_files: List[Tuple[str, int, int]], linux_banner: str,
+                      found_flag: dict, lock: threading.Lock,
+                      known_kaslr_offset: Optional[int] = None) -> Tuple[bool, int, int, int]:
+    """
+    Traverse a single DDR file, trying different phys_offset values.
+
+    Args:
+        file_info: DDR file information (path, base, size)
+        symbols: Symbol table from vmlinux
+        ddr_files: All DDR file information
+        linux_banner: Pre-extracted linux_banner from vmlinux (cached)
+        found_flag: Shared flag to indicate if result found
+        lock: Thread lock for synchronization
+        known_kaslr_offset: Optional known KASLR offset from traditional method
+
+    Returns: (isFound, kaslr_offset, kimage_voffset, phys_offset)
+    """
+    file_path, base, size = file_info
+
+    # Align to 0x10000 (consistent with logic: phys_base = _bfile.base & 0xfffff0000)
+    phys_base = base & 0xfffff0000
+    phys_end = base + size
+
+    # Alignment values list
+    min_image_aligns = [0x00200000, 0x00080000, 0x00008000]
+
+    for min_image_align in min_image_aligns:
+        kimage_load_addr = phys_base
+
+        while kimage_load_addr < phys_end:
+            # Check if found by another thread
+            if found_flag.get('found', False):
+                return False, 0, 0, 0
+
+            try:
+                # Call try_phys_offset with optional known_kaslr_offset
+                result = try_phys_offset(symbols, ddr_files, kimage_load_addr, linux_banner,
+                                       known_kaslr_offset, verbose=False)
+                if result:
+                    kaslr_offset, kimage_voffset, phys_offset = result
+                    # Set found flag
+                    with lock:
+                        found_flag['found'] = True
+                    return True, kaslr_offset, kimage_voffset, phys_offset
+            except Exception as e:
+                # Continue trying next address
+                pass
+
+            kimage_load_addr += min_image_align
+
+    return False, 0, 0, 0
+
+
+def calculate_kimage_voffset_from_kaslr(symbols: Dict[str, int], kaslr_offset: int, phys_offset: int) -> int:
+    """
+    Calculate kimage_voffset using known kaslr_offset.
+
+    This is a simplified calculation method when KASLR offset is already known
+    from traditional detection methods.
+
+    1. Read kernel image start compile-time address = _text compile-time address
+    2. Calculate kernel image start runtime address = _text compile-time address + kaslr_offset
+    3. Calculate kimage_voffset = kernel image start runtime address - phys_offset
+
+    Args:
+        symbols: Symbol table from vmlinux
+        kaslr_offset: Known KASLR offset from traditional method
+        phys_offset: Physical start address of kernel image
+
+    Returns: kimage_voffset value
+    """
+    if '_text' not in symbols:
+        raise Exception("_text symbol not found")
+
+    # Step 1: Get kernel image compile-time start address from symbol table
+    kernel_image_compile_start_addr = symbols['_text']  # kernel image compile-time start address
+
+    # Step 2: Calculate kernel image runtime start address (with KASLR applied)
+    # Formula: kernel runtime start address = kernel compile-time start address + KASLR offset
+    kernel_image_runtime_start_addr = kernel_image_compile_start_addr + kaslr_offset
+
+    # Step 3: Calculate kimage_voffset
+    # Formula: kimage_voffset = kernel runtime start address - kernel physical start address
+    kimage_voffset = kernel_image_runtime_start_addr - phys_offset
+
+    return kimage_voffset
+
+
+def calculate_kaslr(vmlinux: str, dump_dir: str, known_kaslr_offset: Optional[int] = None) -> Tuple[int, int]:
+    """
+    Main function: Calculate kaslr_offset and kimage_voffset.
+
+    Args:
+        vmlinux: Path to vmlinux file
+        dump_dir: Path to dump directory
+        known_kaslr_offset: Optional known KASLR offset from traditional method
+
+    Returns: (kaslr_offset, kimage_voffset)
+    """
+    # 1. Parse symbols
+    sys.stderr.write("Parsing vmlinux symbols...\n")
+    symbols = parse_vmlinux_symbols(vmlinux)
+    if not symbols:
+        raise Exception("Failed to parse vmlinux symbols")
+
+    sys.stderr.write("Found symbols: " + ", ".join(f"{k}=0x{v:016x}" for k, v in symbols.items()) + "\n")
+
+    # 2. Parse DDR files
+    sys.stderr.write("Parsing DDR files...\n")
+    ddr_files, _ = parse_dump_info(dump_dir)
+    sys.stderr.write(f"Found {len(ddr_files)} DDR files\n")
+
+    # 3. Cache linux_banner (avoid repeating strings command)
+    sys.stderr.write("Extracting linux_banner from vmlinux...\n")
+    linux_banner = get_linux_banner_from_vmlinux(vmlinux)
+    if not linux_banner:
+        raise Exception("Failed to extract linux_banner from vmlinux")
+    sys.stderr.write(f"Found {linux_banner} from vmlinux\n")
+
+    # 4. mmap all DDR files to memory (Performance optimization: zero-copy, on-demand loading)
+    sys.stderr.write("Memory-mapping DDR files...\n")
+    ddr_mmaps = []
+    mmap_files = []  # Keep file objects open
+
+    try:
+        for file_path, start_addr, size in ddr_files:
+            try:
+                f = open(file_path, 'rb')
+                mmap_files.append(f)
+                mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                ddr_mmaps.append((mm, start_addr, size))
+            except Exception as e:
+                sys.stderr.write(f"Warning: Failed to mmap {file_path}: {e}\n")
+                # Fallback to file path
+                ddr_mmaps.append((file_path, start_addr, size))
+
+        # 5. Use multi-threading to traverse all DDR files
+        if known_kaslr_offset is not None:
+            sys.stderr.write(f"Using known KASLR offset 0x{known_kaslr_offset:x}, searching for correct phys_offset...\n")
+        else:
+            sys.stderr.write("No known KASLR offset, using complex search method...\n")
+
+        sys.stderr.write("Traverse DDR to find out correct kaslr_offset and phys_offset, it may take a little time to do!!\n")
+
+        # Record start time
+        start_time = time.time()
+
+        # Multi-threading mode: number of threads = number of DDR files
+        max_workers = len(ddr_files)
+        found_flag = {'found': False}
+        lock = threading.Lock()
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit a task for each DDR file, passing known_kaslr_offset
+            futures = [
+                executor.submit(traverse_ddr_file, file_info, symbols, ddr_mmaps, linux_banner,
+                              found_flag, lock, known_kaslr_offset)
+                for file_info in ddr_files
+            ]
+
+            # Wait for any thread to find the result
+            for future in as_completed(futures):
+                isFound, kaslr_offset, kimage_voffset, phys_offset = future.result()
+                if isFound:
+                    elapsed_time = time.time() - start_time
+                    sys.stderr.write(f"<-= Determined kaslr_offset: 0x{kaslr_offset:x} phys_offset: 0x{phys_offset:x} kimage_voffset: 0x{kimage_voffset:x} =->\n")
+                    sys.stderr.write(f"Finished 'determine_kaslr_offset' in {elapsed_time:.2f} secs\n")
+                    return kaslr_offset, kimage_voffset
+
+        raise Exception("Failed to determine correct phys_offset after traversing all DDR files")
+
+    finally:
+        # Cleanup resources: close all mmaps and files
+        for item, _, _ in ddr_mmaps:
+            if isinstance(item, mmap.mmap):
+                try:
+                    item.close()
+                except:
+                    pass
+        for f in mmap_files:
+            try:
+                f.close()
+            except:
+                pass
+
+
+def main():
+    if len(sys.argv) < 3 or len(sys.argv) > 4:
+        sys.stderr.write("Usage: kaslr_calculator.py <vmlinux> <dump_dir> [kaslr_offset]\n")
+        sys.exit(1)
+
+    vmlinux = sys.argv[1]
+    dump_dir = sys.argv[2]
+    known_kaslr_offset = None
+
+    # Parse optional kaslr_offset parameter
+    if len(sys.argv) == 4:
+        kaslr_str = sys.argv[3]
+        if kaslr_str and kaslr_str.strip():
+            try:
+                # Handle hex format (0x prefix)
+                if kaslr_str.startswith('0x') or kaslr_str.startswith('0X'):
+                    known_kaslr_offset = int(kaslr_str, 16)
+                else:
+                    known_kaslr_offset = int(kaslr_str, 10)
+                sys.stderr.write(f"Using provided KASLR offset: 0x{known_kaslr_offset:x}\n")
+            except ValueError:
+                sys.stderr.write(f"Warning: Invalid KASLR offset format '{kaslr_str}', ignoring\n")
+
+    if not os.path.exists(vmlinux):
+        sys.stderr.write(f"Error: vmlinux not found: {vmlinux}\n")
+        sys.exit(1)
+
+    if not os.path.isdir(dump_dir):
+        sys.stderr.write(f"Error: dump directory not found: {dump_dir}\n")
+        sys.exit(1)
+
+    try:
+        kaslr_offset, kimage_voffset = calculate_kaslr(vmlinux, dump_dir, known_kaslr_offset)
+
+        # Output result (hexadecimal format)
+        print(f"0x{kaslr_offset:x} 0x{kimage_voffset:x}")
+
+    except Exception as e:
+        sys.stderr.write(f"Error: {e}\n")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
+EOF
+
+    # Run the temporary Python script with optional third parameter  2>&1
+    if [ -n "$known_kaslr" ]; then
+        python3 "${temp_python_script}" "${vmlinux_path}" "${dump_dir_path}" "${known_kaslr}" 2>&1
+    else
+        python3 "${temp_python_script}" "${vmlinux_path}" "${dump_dir_path}" 2>&1
+    fi
+    local ret=$?
+    rm -f "${temp_python_script}"
+    return $ret
+}
+
+# ==============================================================================
+# Shell Helper Functions
+# ==============================================================================
+
+ulimit -c unlimited
+
+# Global Variables
 current_dir=$(pwd)
 crash_dir=$(dirname $(which qcrash))
 vmlinux_file=""
 cmm_file=""
+dump_dir=""
 kernel_ver=""
-koffset_str=""
+platform_info=""
 crashcmd=""
 ddr_info=""
 blank="  "
-platform_info=""
-dump_dir=""
 
-# Usage function
+# KASLR Results
+kaslr_offset=""
+kimage_voffset=""
+va_bits=""
+manual_kaslr_offset=""  # User-specified KASLR offset via -kaslr parameter
+
 usage() {
-    echo -e "\n\033[31mCommand Error, Please refer below usage:\033[0m"
-    echo -e "\033[33m    export CRASH_BIN=<crash binary path> \033[0m"
-    echo -e "\033[33m    Usage1: qcrash \033[0m"
-    echo -e "\033[33m        ex. qcrash \033[0m"
-    echo -e "\033[33m    Usage2: qcrash <target vmlinux> <target load.cmm> \033[0m"
-    echo -e "\033[33m        ex. qcrash vmlinux load.cmm or qcrash load.cmm vmlinux\033[0m"
-    echo -e "\033[33mPlease do make sure your vmlinux exist in parent directory(deep level=5) when you are using usage1\033[0m\n"
-    exit
+    log_error "Command Error, Please refer below usage:"
+    log_warn "    Usage1: qcrash"
+    log_warn "        ex. qcrash"
+    log_warn "    Usage2: qcrash <target vmlinux> <target load.cmm>"
+    log_warn "        ex. qcrash vmlinux load.cmm or qcrash load.cmm vmlinux"
+    log_warn "    Usage3: qcrash -kaslr=<offset>"
+    log_warn "        ex. qcrash -kaslr=0x12345678"
+    log_warn "    Usage4: qcrash -kaslr=<offset> <target vmlinux> <target load.cmm>"
+    log_warn "        ex. qcrash -kaslr=0x12345678 vmlinux load.cmm"
+    log_warn "    Usage5: qcrash <target vmlinux> <target load.cmm> -kaslr=<offset>"
+    log_warn "        ex. qcrash vmlinux load.cmm -kaslr=0x12345678"
+    log_warn ""
+    log_warn "    -kaslr=<offset>: Manually specify KASLR offset (hex or decimal)"
+    log_warn "                     If not specified, KASLR offset will be auto-detected"
+    log_warn "Please do make sure your vmlinux exist in parent directory(deep lever=5) when you are using usage1"
+    exit 1
 }
 
-if [[ -z "${CRASH_BIN}" ]]; then
-    echo -e "\033[33m    CRASH_BIN is not set. Please export it before running this script. \033[0m"
-    usage
-fi
+parse_kaslr_param() {
+    local param="$1"
+    if [[ "$param" =~ ^-kaslr=(.+)$ ]]; then
+        local kaslr_value="${BASH_REMATCH[1]}"
 
-# 1. Get the vmlinux path and the load.cmm path
-get_file() {
-    if [ $# -eq 2 ]; then
-        if [[ "$1" =~ "vmlinux" ]]; then
-            vmlinux_file="${current_dir}/$1"
-            cmm_file="${current_dir}/$2"
-        elif [[ "$1" =~ "load.cmm" ]]; then
-            cmm_file="${current_dir}/$1"
-            vmlinux_file="${current_dir}/$2"
+        # Validate and parse KASLR value
+        if [[ "$kaslr_value" =~ ^0x[0-9a-fA-F]+$ ]]; then
+            # Hexadecimal format
+            manual_kaslr_offset="$kaslr_value"
+            return 0
+        elif [[ "$kaslr_value" =~ ^[0-9]+$ ]]; then
+            # Decimal format - convert to hex
+            local decimal_value="$kaslr_value"
+            manual_kaslr_offset=$(printf "0x%x" "$decimal_value")
+            return 0
+        else
+            log_error "Invalid KASLR offset format: $kaslr_value"
+            log_error "Expected hex format (0x12345678) or decimal format (305419896)"
+            exit 1
         fi
-    elif [ $# -eq 0 ]; then
-        vmlinux_path="${current_dir}"
+    fi
+    return 1
+}
+
+parse_args() {
+    local args=()
+    local kaslr_found=false
+
+    # First pass: extract -kaslr parameter and collect other arguments
+    for arg in "$@"; do
+        if parse_kaslr_param "$arg"; then
+            kaslr_found=true
+            log_info "Using manual KASLR offset: ${manual_kaslr_offset}"
+        else
+            args+=("$arg")
+        fi
+    done
+
+    # Second pass: parse remaining arguments
+    local arg_count=${#args[@]}
+
+    if [ $arg_count -eq 2 ]; then
+        if [[ "${args[0]}" =~ "vmlinux" ]]; then
+            vmlinux_file="${current_dir}/${args[0]}"
+            cmm_file="${current_dir}/${args[1]}"
+        elif [[ "${args[0]}" =~ "load.cmm" ]]; then
+            cmm_file="${current_dir}/${args[0]}"
+            vmlinux_file="${current_dir}/${args[1]}"
+        else
+            usage
+        fi
+    elif [ $arg_count -eq 0 ]; then
+        # Auto-detect mode
+        local vmlinux_path="${current_dir}"
         vmlinux_file="${vmlinux_path}/vmlinux"
         if [ ! -f "${vmlinux_file}" ]; then
             for i in {1..5}; do
@@ -63,7 +983,7 @@ get_file() {
             [ ! -f "${vmlinux_file}" ] && usage
         fi
 
-        cmm_path="${current_dir}"
+        local cmm_path="${current_dir}"
         cmm_file="${cmm_path}/load.cmm"
         dump_dir="${cmm_path}"
         if [ ! -f "${cmm_file}" ]; then
@@ -77,110 +997,281 @@ get_file() {
             done
             [ ! -f "${cmm_file}" ] && usage
         fi
+    else
+        usage
+    fi
+
+    # Ensure dump_dir is set if not set by auto-detect
+    if [ -z "${dump_dir}" ]; then
+        dump_dir=$(dirname "${cmm_file}")
     fi
 }
-get_file "$@"
 
-# 2. Get kernel version
 get_kernel_version() {
-    kernel_version=$(strings "${vmlinux_file}" | grep "Linux version")
-    kernel_version=${kernel_version%%"SMP PREEMPT"*}
-    kernel_version=${kernel_version##*"Linux version"}
-    kernel_version=${kernel_version%%"("*}
-    kernel_version=${kernel_version:0:7}
-    IFS="." read -r maj min _ <<< "${kernel_version}"
-    kernel_ver="${maj}.${min}"
+    if [ -f "${vmlinux_file}" ]; then
+        local version_str
+        version_str=$(strings "${vmlinux_file}" | grep "Linux version" | head -1)
+        # Simplify parsing logic
+        local temp=${version_str%%"SMP PREEMPT"*}
+        temp=${temp##*"Linux version"}
+        temp=${temp%%"("*}
+        # Extract X.Y
+        if [[ $temp =~ ([0-9]+\.[0-9]+) ]]; then
+            kernel_ver="${BASH_REMATCH[1]}"
+        else
+            kernel_ver="unknown"
+        fi
+    else
+        log_error "vmlinux file not found at ${vmlinux_file}"
+        exit 1
+    fi
 }
-get_kernel_version
 
-item_list=(
-    0x08600000      0x086006d0      OCIMEM.BIN
+# KASLR offset detection
+#   imem_start     kaslr_addr     filename
+# There are only 5 types address:
+kaslr_item_list=(
+
 )
 
 dec2hex() {
     printf "%x" "$1"
 }
 
-get_koffset() {
-    for (( h=0; h < ${#item_list[@]}/3; h++ )); do
-        istart=${item_list[$((h * 3 + 0))]}
-        kaddr=${item_list[$((h * 3 + 1))]}
-        filename=${item_list[$((h * 3 + 2))]}
-        [[ ! $istart =~ '0x' ]] && continue
-        ((koffset=kaddr-istart))
-        koffset=0x$(dec2hex $koffset)
-        aa=$(od -A x -t x -j $koffset -N 0x10 "${dump_dir}/${filename}")
-        value=${aa:7:8}
-        if [ "$value" = "dead4ead" ]; then
-            koffset_str=" --kaslr=0x${aa:25:8}${aa:16:8}"
-            return
+get_kaslr_offset() {
+    # Check if manual KASLR offset is specified
+    if [ -n "$manual_kaslr_offset" ]; then
+        log_info "Using manual KASLR offset: ${manual_kaslr_offset}"
+        log_info "Calculating kimage_voffset with manual KASLR offset..."
+
+        local kaslr_result
+        kaslr_result=$(calculate_kaslr_python "${vmlinux_file}" "${dump_dir}" "${manual_kaslr_offset}")
+        local ret=$?
+
+        if [ $ret -eq 0 ] && [ -n "$kaslr_result" ]; then
+            # Parse last line of Python output (now only two values)
+            local last_line=$(echo "$kaslr_result" | tail -n 1)
+            read -r kaslr_hex kimage_voffset_hex <<< "$last_line"
+
+            if [[ "$kaslr_hex" =~ ^0x[0-9a-fA-F]+$ ]]; then
+                kaslr_offset="${kaslr_hex}"
+                kimage_voffset="${kimage_voffset_hex}"
+                log_info "Manual KASLR calculation result:"
+                log_info "  kaslr_offset: ${kaslr_offset}"
+                log_info "  kimage_voffset: ${kimage_voffset}"
+                kaslr_offset_str=" --kaslr=${kaslr_offset}"
+                return 0
+            else
+                log_error "Manual KASLR calculation returned invalid format: ${last_line}"
+                exit 1
+            fi
+        else
+            log_error "Manual KASLR calculation failed with return code: ${ret}"
+            log_error "Please check if the specified KASLR offset is correct"
+            exit 1
+        fi
+    fi
+
+    # Auto-detection mode
+    local traditional_kaslr=""
+
+    # Try traditional method first
+    for (( h=0; h < ${#kaslr_item_list[@]}/3; h++ )); do
+        imem_start=${kaslr_item_list[$((h * 3 + 0))]}
+        kaslr_addr=${kaslr_item_list[$((h * 3 + 1))]}
+        filename=${kaslr_item_list[$((h * 3 + 2))]}
+        [[ ! $imem_start =~ '0x' ]] && continue
+
+        # Check if the required file exists
+        if [ ! -f "${dump_dir}/${filename}" ]; then
+            continue
+        fi
+
+        ((kaslr_offset=kaslr_addr-imem_start))
+        kaslr_offset=0x$(dec2hex $kaslr_offset)
+        aa=$(od -A x -t x -j $kaslr_offset -N 0x10 "${dump_dir}/${filename}" 2>/dev/null)
+
+        if [ $? -eq 0 ]; then
+            value=${aa:7:8}
+            if [ "$value" = "dead4ead" ]; then
+                traditional_kaslr="0x${aa:25:8}${aa:16:8}"
+                log_info "Detected KASLR offset: ${traditional_kaslr}"
+                break
+            fi
         fi
     done
-    koffset_str=" "
-}
-get_koffset
 
-# 4. Get platform
-is_64bit_platform() {
-    cmd_res=$(hexdump -n 1 -s 4 "${vmlinux_file}")
-    tmp=${cmd_res#* }
-    platform=${tmp% *}
-    if [[ ${platform} -eq 1 ]]; then
-        platform_info="32bit"
-    elif [[ ${platform} -eq 2 ]]; then
-        platform_info="64bit"
+    # Always call Python calculator, but pass traditional result if available
+    local kaslr_result
+    if [ -n "$traditional_kaslr" ]; then
+        log_info "Calculator kimage_voffset with KASLR offset"
+        kaslr_result=$(calculate_kaslr_python "${vmlinux_file}" "${dump_dir}" "${traditional_kaslr}")
     else
-        echo -e "\033[32m    Unknown platform\033[0m"
-        exit
+        log_warn "Search KASLR offset from DDR"
+        kaslr_result=$(calculate_kaslr_python "${vmlinux_file}" "${dump_dir}")
     fi
-    crashcmd="${CRASH_BIN} -x"
-}
-is_64bit_platform
 
-# 5. Get DDR info
+    local ret=$?
+
+    if [ $ret -eq 0 ] && [ -n "$kaslr_result" ]; then
+        # Parse last line of Python output (now only two values)
+        local last_line=$(echo "$kaslr_result" | tail -n 1)
+        read -r kaslr_hex kimage_voffset_hex <<< "$last_line"
+
+        if [[ "$kaslr_hex" =~ ^0x[0-9a-fA-F]+$ ]]; then
+            kaslr_offset="${kaslr_hex}"
+            kimage_voffset="${kimage_voffset_hex}"
+            log_info "Python calculator result:"
+            log_info "  kaslr_offset: ${kaslr_offset}"
+            log_info "  kimage_voffset: ${kimage_voffset}"
+            kaslr_offset_str=" --kaslr=${kaslr_offset}"
+            return 0
+        else
+            log_warn "Python calculator returned invalid format: ${last_line}"
+        fi
+    else
+        log_warn "Python calculator failed with return code: ${ret}"
+    fi
+
+    # Both methods failed
+    kaslr_offset_str=" "
+    log_warn "Both traditional and Python KASLR detection methods failed"
+    log_warn "KASLR may be disabled or dump files may be incomplete"
+    return 1
+}
+
+is_64bit_platform() {
+    # Check ELF header class (5th byte): 1=32-bit, 2=64-bit
+    local class
+    class=$(od -An -j4 -N1 -t u1 "${vmlinux_file}" | tr -d ' ')
+
+    if [[ ${class} -eq 1 ]]; then
+        platform_info="32bit"
+        CRASH_HOME="${crash_dir}/crash/output/crash32"
+        # Assuming plugin path logic follows platform
+    elif [[ ${class} -eq 2 ]]; then
+        platform_info="64bit"
+        CRASH_HOME="${crash_dir}/crash/output/crash64"
+    else
+        log_warn "Unknown platform class: ${class}, defaulting to 64bit"
+        platform_info="64bit"
+        CRASH_HOME="${crash_dir}/crash/output/crash64"
+    fi
+
+    export CRASH_EXTENSIONS="${CRASH_HOME}/extensions"
+    crashcmd="${CRASH_HOME}/crash -x"
+}
+
 get_ddr_info() {
-    a=0
+    if [ ! -f "${cmm_file}" ]; then
+        log_error "load.cmm not found at ${cmm_file}"
+        exit 1
+    fi
+
+    # Simplified DDR parsing logic
+    # Looking for lines with DDRC and extracting paths
+    local ddr_list=""
+    local prev_word=""
+
     while read -r line; do
-        for i in $line; do
-            if [ $a -eq 1 ]; then
-                ddr_info="${ddr_info}${i},"
-                a=0
-            fi
-            str1=${i:0:4}
-            if [ "$str1" = "DDRC" ]; then
-                ddr_info="${ddr_info}${dump_dir}/${i}@"
-                a=1
+        for word in $line; do
+            if [[ $word == DDRC* ]]; then
+                local fname="$word"
+                ddr_list="${ddr_list}${dump_dir}/${fname}@"
+                prev_word="pending_addr"
+            elif [ "$prev_word" == "pending_addr" ]; then
+                ddr_list="${ddr_list}${word},"
+                prev_word=""
             fi
         done
     done < "${cmm_file}"
-    ddr_info=${ddr_info%,}
+    ddr_info=${ddr_list%,} # Remove trailing comma
 }
-get_ddr_info
 
-# 6. Recursively search for zram.ko and zsmalloc.ko and write to cmd_modules.txt
-cmd_modules_file="${current_dir}/cmd_modules.txt"
-> "$cmd_modules_file"
+prepare_modules() {
+    local cmd_modules_file="${current_dir}/cmd_modules.txt"
+    > "$cmd_modules_file"
 
-while IFS= read -r -d '' file; do
-    mod_name=$(basename "$file" .ko)
-    echo "mod -s $mod_name $(realpath "$file")" >> "$cmd_modules_file"
-done < <(find "$current_dir" -type f \( -name "zram.ko" -o -name "zsmalloc.ko" \) -print0)
+    # Find modules efficiently
+    find "$current_dir" -type f \( -name "zram.ko" -o -name "zsmalloc.ko" \) -print0 | while IFS= read -r -d '' file; do
+        local mod_name=$(basename "$file" .ko)
+        echo "mod -s $mod_name $(realpath "$file")" >> "$cmd_modules_file"
+    done
+}
 
-# 7. Execute crash utility
-qcrash() {
-    crashcmd="${crashcmd}${blank}${vmlinux_file}${blank}${ddr_info}${blank}${koffset_str}"
-    crashcmd="${crashcmd} --machdep vabits_actual=39"
-    if [ -s "$cmd_modules_file" ]; then
-        crashcmd="${crashcmd} -i ${cmd_modules_file}"
+# ==============================================================================
+# Main Logic
+# ==============================================================================
+main() {
+    # 1. Parse Arguments
+    parse_args "$@"
+
+    log_info "vmlinux: ${vmlinux_file}"
+    log_info "load.cmm: ${cmm_file}"
+    log_info "DUMP: ${dump_dir}"
+
+    # 2. Get Kernel Version
+    get_kernel_version
+    log_info "Kernel Version: ${kernel_ver}"
+
+    # 3. Platform Detection
+    is_64bit_platform
+    log_info "Platform: ${platform_info}"
+
+    # 4. VA bits calculation
+    local va_bits_result
+    va_bits_result=$(calculate_va_bits "${vmlinux_file}")
+    local va_bits_ret=$?
+
+    if [ $va_bits_ret -eq 0 ] && [ -n "$va_bits_result" ]; then
+        # Parse the last line to get va_bits
+        va_bits=$(echo "$va_bits_result" | tail -n 1)
+        if [[ "$va_bits" =~ ^[0-9]+$ ]]; then
+            log_info "VA bits: ${va_bits}"
+        else
+            log_warn "Invalid VA bits format: ${va_bits}, using default 39"
+            va_bits="39"
+        fi
+    else
+        log_warn "VA bits calculation failed, using default 39"
+        va_bits="39"
     fi
+
+    # 5. KASLR Calculation
+    get_kaslr_offset
+
+    # 6. DDR Info
+    get_ddr_info
+
+    # 7. Prepare Modules
+    prepare_modules
+
+    # 8. Construct Command
+    crashcmd="${crashcmd}${blank}${vmlinux_file}${blank}${ddr_info}"
+
+    if [ -n "$kaslr_offset" ]; then
+        crashcmd="${crashcmd}${blank}--kaslr=${kaslr_offset}"
+    fi
+
+    if [ -n "$va_bits" ]; then
+        crashcmd="${crashcmd} --machdep vabits_actual=${va_bits}"
+    fi
+
+    if [ -n "$kimage_voffset" ] && [ "$kimage_voffset" != "0x0" ]; then
+        crashcmd="${crashcmd} --machdep kimage_voffset=${kimage_voffset}"
+    else
+        log_warn "Hint: kimage_voffset not set (defaulting to 0x0)"
+    fi
+
+    if [ -s "${current_dir}/cmd_modules.txt" ]; then
+        crashcmd="${crashcmd} -i ${current_dir}/cmd_modules.txt"
+    fi
+
+    log_info "Executing: ${crashcmd}"
+
+    # 9. Execute
+    eval ${crashcmd}
 }
-qcrash
 
-echo -e "\033[33m    vmlinux: ${vmlinux_file}\033[0m"
-echo -e "\033[33m    load.cmm: ${cmm_file}\033[0m"
-echo -e "\033[33m    Kernel Version: ${kernel_ver}\033[0m"
-echo -e "\033[33m    Platform: ${platform_info}\033[0m"
-echo -e "\033[33m    DUMP: ${dump_dir}\033[0m"
-echo -e "\033[32m    Crashcmd: ${crashcmd}\033[0m"
-
-eval ${crashcmd}
+# Entry point
+main "$@"
