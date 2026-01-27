@@ -13,9 +13,10 @@
  * SPDX-License-Identifier: GPL-2.0-only
  */
 
-#ifndef LPAE_IOMMU_LIB_H
-#define LPAE_IOMMU_LIB_H
+#ifndef LPAE_PAGETABLE_H_
+#define LPAE_PAGETABLE_H_
 
+#include "../plugin.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -23,17 +24,15 @@
 #include <memory>
 #include <functional>
 
-namespace lpae_iommu {
+// Constants for page table structure (ARM32 LPAE specific)
+constexpr size_t LPAE_NUM_FL_PTE = 4;      // First-level page table entries
+constexpr size_t LPAE_NUM_SL_PTE = 512;    // Second-level page table entries
+constexpr size_t LPAE_NUM_TL_PTE = 512;    // Third-level page table entries
 
-// Constants for page table structure
-constexpr size_t NUM_FL_PTE = 4;      // First-level page table entries
-constexpr size_t NUM_SL_PTE = 512;    // Second-level page table entries
-constexpr size_t NUM_TL_PTE = 512;    // Third-level page table entries
-
-// Page sizes
-constexpr uint64_t SZ_4K = 0x1000;
-constexpr uint64_t SZ_2M = 0x200000;
-constexpr uint64_t SZ_1G = 0x40000000;
+// Page sizes (ARM32 LPAE specific)
+constexpr uint64_t LPAE_SZ_4K = 0x1000;
+constexpr uint64_t LPAE_SZ_2M = 0x200000;
+constexpr uint64_t LPAE_SZ_1G = 0x40000000;
 
 // Descriptor types
 enum class DescriptorType : uint8_t {
@@ -59,41 +58,45 @@ struct MemoryAttributes {
 
     MemoryAttributes();
     std::vector<std::string> get_attribute_strings() const;
-    bool operator==(const MemoryAttributes& other) const;
+    bool operator==(const MemoryAttributes& other) const noexcept;
 };
 
-// Mapping information base class
-class MappingInfo {
+// Mapping information base class (LPAE specific)
+class LPAEMappingInfo {
 public:
-    virtual ~MappingInfo() = default;
+    virtual ~LPAEMappingInfo() = default;
     virtual bool is_leaf() const = 0;
 };
 
 // Leaf mapping (actual memory mapping)
-class LeafMapping : public MappingInfo {
+class LPAELeafMapping : public LPAEMappingInfo {
 public:
     uint64_t virt_addr;
     uint64_t phys_addr;
     uint64_t page_size;
     MemoryAttributes attributes;
 
-    LeafMapping(uint64_t virt, uint64_t phys, uint64_t size,
-                const MemoryAttributes& attrs);
+    LPAELeafMapping(uint64_t virt, uint64_t phys, uint64_t size,
+                    const MemoryAttributes& attrs);
 
     bool is_leaf() const override { return true; }
-    std::pair<uint64_t, uint64_t> phys_addr_range() const;
+    std::pair<uint64_t, uint64_t> phys_addr_range() const noexcept;
     std::string to_string() const;
 };
 
 // Table mapping (pointer to next level)
-class TableMapping : public MappingInfo {
+class LPAETableMapping : public LPAEMappingInfo {
 public:
     uint64_t next_table_addr;
 
-    explicit TableMapping(uint64_t addr);
+    explicit LPAETableMapping(uint64_t addr);
     bool is_leaf() const override { return false; }
     std::string to_string() const;
 };
+
+// Mapping range type: (virt_start, virt_end) -> LPAELeafMapping or nullptr (unmapped)
+using LPAEMappingRange = std::pair<uint64_t, uint64_t>;
+using LPAEMappingMap = std::map<LPAEMappingRange, std::shared_ptr<LPAELeafMapping>>;
 
 // Virtual address register for index extraction
 class VirtualAddressRegister {
@@ -103,42 +106,52 @@ public:
 
     VirtualAddressRegister(uint64_t addr, uint32_t split);
 
-    uint32_t get_fl_index() const;
-    uint32_t get_sl_index() const;
-    uint32_t get_tl_index() const;
-    uint32_t get_page_offset() const;
-    uint64_t get_rest(uint32_t n) const;
-};
-
-// Memory reader interface - to be implemented by the caller
-class IMemoryReader {
-public:
-    virtual ~IMemoryReader() = default;
-    virtual uint64_t read_dword(uint64_t address, bool virtual_addr = false) = 0;
-    virtual bool is_valid_address(uint64_t address) = 0;
+    uint32_t get_fl_index() const noexcept;
+    uint32_t get_sl_index() const noexcept;
+    uint32_t get_tl_index() const noexcept;
+    uint32_t get_page_offset() const noexcept;
+    uint64_t get_rest(uint32_t n) const noexcept;
 };
 
 // ARMv7 LPAE MMU implementation
-class Armv7LPAEMMU {
+class Armv7LPAEMMU : public ParserPlugin {
 public:
-    Armv7LPAEMMU(IMemoryReader* reader, uint64_t pgtbl, uint32_t txsz,
-                 bool virt_for_fl = false);
+    Armv7LPAEMMU();
+
+    // ParserPlugin interface implementation
+    void cmd_main(void) override;
+    void init_command(void) override;
+    void init_offset(void) override;
 
     // Main translation function
-    std::unique_ptr<MappingInfo> translate(uint64_t virt_addr);
+    std::unique_ptr<LPAEMappingInfo> translate(uint64_t virt_addr);
 
     // Level-specific translation functions
-    std::unique_ptr<MappingInfo> translate_first_level(VirtualAddressRegister& virt_r);
-    std::unique_ptr<MappingInfo> translate_second_level(VirtualAddressRegister& virt_r,
-                                                         uint64_t level2_table_addr,
-                                                         uint32_t block_split = 0);
-    std::unique_ptr<MappingInfo> translate_third_level(VirtualAddressRegister& virt_r,
-                                                        uint64_t level3_table_addr);
+    std::unique_ptr<LPAEMappingInfo> translate_first_level(VirtualAddressRegister& virt_r);
+    std::unique_ptr<LPAEMappingInfo> translate_second_level(VirtualAddressRegister& virt_r,
+                                                             uint64_t level2_table_addr,
+                                                             uint32_t block_split = 0);
+    std::unique_ptr<LPAEMappingInfo> translate_third_level(VirtualAddressRegister& virt_r,
+                                                            uint64_t level3_table_addr);
 
     uint32_t get_input_addr_split() const { return input_addr_split_; }
 
+    // High-level page table analysis functions (merged from LPAEIommuLib)
+    LPAEMappingMap get_flat_mappings();
+    LPAEMappingMap get_coalesced_mappings(const LPAEMappingMap& flat_mappings);
+    void print_lpae_mappings(const LPAEMappingMap& mappings, std::ostream& outfile) const;
+    void print_lpae_mappings_direct(const LPAEMappingMap& mappings) const;
+
+    // Main entry point for page table parsing and printing
+    // @param pg_table: Physical address of the page table base
+    // @param client_name: Name of the client for display purposes
+    // @param is_process_table: true for process page tables, false for IOMMU page tables
+    // Note: Only supports 4GB (32-bit) virtual address space (T0SZ=0)
+    bool parse_long_form_tables(uint64_t pg_table,
+                                const std::string& client_name,
+                                bool is_process_table = false);
+
 private:
-    IMemoryReader* reader_;
     uint64_t pgtbl_;
     uint32_t txsz_;
     bool virt_for_fl_;
@@ -159,45 +172,13 @@ private:
                                      uint32_t block_split, bool virtual_addr = false);
     Descriptor do_tl_level_lookup(uint64_t table_base_address, uint32_t table_index);
 
-    MemoryAttributes extract_attributes(uint64_t descriptor_value);
-    uint64_t extract_output_address(uint64_t descriptor_value, uint32_t n);
+    MemoryAttributes extract_attributes(uint64_t descriptor_value) const noexcept;
+    uint64_t extract_output_address(uint64_t descriptor_value, uint32_t n) const noexcept;
+
+    // Helper functions for formatting output (merged from LPAEIommuLib)
+    std::string format_mapping(uint64_t vstart, uint64_t vend, const LPAELeafMapping* info) const;
+    std::string format_unmapped(uint64_t vstart, uint64_t vend) const;
+    std::string get_size_string(uint64_t size) const;
 };
 
-// Mapping range type: (virt_start, virt_end) -> LeafMapping or nullptr (unmapped)
-using MappingRange = std::pair<uint64_t, uint64_t>;
-using MappingMap = std::map<MappingRange, std::shared_ptr<LeafMapping>>;
-
-// Main library functions
-class LPAEIommuLib {
-public:
-    // Get flat (uncoalesced) mappings from page tables
-    static MappingMap get_flat_mappings(IMemoryReader* reader,
-                                        uint64_t pg_table,
-                                        uint32_t t0sz = 0);
-
-    // Coalesce contiguous mappings with same attributes
-    static MappingMap get_coalesced_mappings(const MappingMap& flat_mappings);
-
-    // Print mappings to output stream
-    static void print_lpae_mappings(const MappingMap& mappings,
-                                    std::ostream& outfile);
-
-    // Parse and dump page tables (main entry point)
-    static bool parse_long_form_tables(IMemoryReader* reader,
-                                       uint64_t pg_table,
-                                       uint32_t domain_num,
-                                       const std::string& client_name,
-                                       const std::string& iommu_context,
-                                       const std::string& redirect_status,
-                                       std::ostream& outfile);
-
-private:
-    static std::string format_mapping(uint64_t vstart, uint64_t vend,
-                                     const LeafMapping* info);
-    static std::string format_unmapped(uint64_t vstart, uint64_t vend);
-    static std::string get_size_string(uint64_t size);
-};
-
-} // namespace lpae_iommu
-
-#endif // LPAE_IOMMU_LIB_H
+#endif // LPAE_PAGETABLE_H_

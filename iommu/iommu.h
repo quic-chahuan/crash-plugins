@@ -18,6 +18,7 @@
 
 #include "plugin.h"
 #include "../utils/aarch64_pagetable.h"
+#include "../utils/lpae_pagetable.h"
 
 #include <memory>
 #include <string>
@@ -198,7 +199,7 @@ public:
      */
     IOMMU();
 
-    void dump_aarch64_page_tables(std::string& name);
+    void dump_page_tables(std::string& name);
 
     /**
      * @brief Main command entry point
@@ -285,7 +286,7 @@ public:
      *
      * Walks the page tables and displays virtual-to-physical mappings
      */
-    void dump_aarch64_page_tables(const std::string& name);
+    void dump_page_tables(const std::string& name);
 
     // Plugin instance definition macro
     DEFINE_PLUGIN_INSTANCE(IOMMU)

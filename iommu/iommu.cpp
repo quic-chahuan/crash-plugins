@@ -23,6 +23,40 @@ DEFINE_PLUGIN_COMMAND(IOMMU)
 #endif
 
 /**
+ * Dump page tables for all SMMU clients (supports both AArch64 and ARM32 LPAE)
+ */
+void IOMMU::dump_page_tables(const std::string& name) {
+    if (smmu_client_list.empty()) {
+        parser_iommu_client();
+    }
+    if (smmu_client_list.empty()) {
+        PRINT("No SMMU clients found\n");
+        return;
+    }
+
+    for (const auto& client : smmu_client_list) {
+        if (client->client_name == name && client->ttbr0 != 0 && client->levels > 0) {
+#if defined(ARM64)
+            bool is_aarch64_format = (client->fmt_str.find("ARM_64") != std::string::npos) ||
+                                   (client->fmt_str.find("AARCH64") != std::string::npos);
+            if (is_aarch64_format) {
+                // Use AArch64 parser for 64-bit page tables on AArch64 targets
+                AArch64PTParser parser;
+                parser.parse_and_print_tables(client->ttbr0, client->levels, client->client_name);
+            }
+#else
+            bool is_lpae_format = (client->fmt_str.find("LPAE") != std::string::npos) ||
+                    (client->fmt_str.find("ARM_32") != std::string::npos);
+            if (is_lpae_format) {
+                Armv7LPAEMMU parser;
+                parser.parse_long_form_tables(client->ttbr0, client->client_name, false);
+            }
+#endif
+        }
+    }
+}
+
+/**
  * @brief Main command entry point for IOMMU analysis
  *
  */
@@ -60,7 +94,7 @@ void IOMMU::cmd_main(void) {
             case 'p':
                 // Dump page tables for specified domain
                 if (optarg) {
-                    dump_aarch64_page_tables(std::string(optarg));
+                    dump_page_tables(std::string(optarg));
                 } else {
                     LOGE("Error: -p option requires a domain name argument\n");
                     argerrs++;
@@ -1485,26 +1519,6 @@ void IOMMU::init_command(void) {
  */
 IOMMU::IOMMU() {
 
-}
-
-/**
- * Dump AArch64 page tables for all SMMU clients
- */
-void IOMMU::dump_aarch64_page_tables(const std::string& name) {
-    if (smmu_client_list.empty()) {
-        parser_iommu_client();
-    }
-    if (smmu_client_list.empty()) {
-        PRINT("No SMMU clients found\n");
-        return;
-    }
-    for (const auto& client : smmu_client_list) {
-        if (client->client_name == name && client->ttbr0 != 0 && client->levels > 0) {
-            // Create an instance of AArch64PTParser and use it
-            AArch64PTParser parser;
-            parser.parse_and_print_tables(client->ttbr0, client->levels, client->client_name);
-        }
-    }
 }
 
 #pragma GCC diagnostic pop

@@ -34,6 +34,32 @@ void AArch64PTParser::init_command(void) {
 void AArch64PTParser::init_offset(void) {
 
 }
+
+/**
+ * Read 64-bit value from physical or virtual address based on page table type
+ */
+uint64_t AArch64PTParser::read_pte_entry(ulong addr, const char* desc) {
+    uint64_t value = 0;
+
+    if (current_page_table_type == PROCESS_PAGE_TABLE) {
+        // For process page tables, read directly from physical address
+        if (!readmem(addr, PHYSADDR, &value, sizeof(value), (char*)desc, RETURN_ON_ERROR)) {
+            LOGD("Failed to read %s from physical address 0x%lx\n", desc, addr);
+            return 0;
+        }
+    } else {
+        // For IOMMU page tables, use phy_to_virt conversion
+        ulong virt_addr = phy_to_virt(addr);
+        if (!is_kvaddr(virt_addr)) {
+            LOGD("Failed to convert physical address 0x%lx to virtual for %s\n", addr, desc);
+            return 0;
+        }
+        value = read_ulonglong(virt_addr, desc);
+    }
+
+    return value;
+}
+
 /**
  * Get page size order string
  */
@@ -218,13 +244,7 @@ void AArch64PTParser::add_flat_mapping(std::map<uint64_t, FlatMapping>& mappings
 MappingInfo AArch64PTParser::get_super_section_mapping_info(ulong pg_table, int index) {
     MappingInfo info = {-1, SZ_1G, 0, true, 0, -1, -1, -1};
 
-    ulong pg_table_virt = phy_to_virt(pg_table);
-    if (!is_kvaddr(pg_table_virt)) {
-        info.status = false;
-        return info;
-    }
-
-    uint64_t phy_addr = read_ulonglong(pg_table_virt, "phy_addr");
+    uint64_t phy_addr = read_pte_entry(pg_table, "super_section_entry");
 
     if (phy_addr != 0) {
         info.map_type = phy_addr & LL_AP_BITS;
@@ -242,13 +262,7 @@ MappingInfo AArch64PTParser::get_super_section_mapping_info(ulong pg_table, int 
 MappingInfo AArch64PTParser::get_section_mapping_info(ulong pg_table, int index) {
     MappingInfo info = {-1, SZ_2M, 0, true, 0, 0, -1, 0};
 
-    ulong pg_table_virt = phy_to_virt(pg_table);
-    if (!is_kvaddr(pg_table_virt)) {
-        info.status = false;
-        return info;
-    }
-
-    uint64_t phy_addr = read_ulonglong(pg_table_virt, "phy_addr");
+    uint64_t phy_addr = read_pte_entry(pg_table, "section_entry");
 
     if (phy_addr != 0) {
         info.map_type = phy_addr & LL_AP_BITS;
@@ -284,14 +298,7 @@ MappingInfo AArch64PTParser::get_mapping_info(ulong pg_table, int index) {
     MappingInfo info = {-1, SZ_4K, 0, true, 0, 0, -1, 0};
 
     ulong ll_pte = pg_table + (index * 8);
-    ulong ll_pte_virt = phy_to_virt(ll_pte);
-
-    if (!is_kvaddr(ll_pte_virt)) {
-        info.status = false;
-        return info;
-    }
-
-    uint64_t phy_addr = read_ulonglong(ll_pte_virt, "phy_addr");
+    uint64_t phy_addr = read_pte_entry(ll_pte, "page_entry");
 
     if (phy_addr != 0) {
         info.map_type = phy_addr & LL_AP_BITS;
@@ -327,12 +334,7 @@ MappingInfo AArch64PTParser::get_mapping_info(ulong pg_table, int index) {
  * Read first level page table entry
  */
 std::pair<uint64_t, ulong> AArch64PTParser::fl_entry(ulong fl_pte, int skip_fl) {
-    ulong fl_pte_virt = phy_to_virt(fl_pte);
-    if (!is_kvaddr(fl_pte_virt)) {
-        return {0, 0};
-    }
-
-    uint64_t fl_pg_table_entry = read_ulonglong(fl_pte_virt, "fl_pg_table_entry");
+    uint64_t fl_pg_table_entry = read_pte_entry(fl_pte, "fl_pg_table_entry");
     ulong sl_pte = fl_pg_table_entry & FLSL_BASE_MASK;
 
     if (skip_fl == 1) {
@@ -356,13 +358,7 @@ std::map<uint64_t, FlatMapping> AArch64PTParser::parse_2nd_level_table(
     int section_skip_count = 0;
 
     for (int tl_index = 0; tl_index < NUM_TL_PTE; ++tl_index) {
-        ulong tl_pte_virt = phy_to_virt(tl_pte);
-        if (!is_kvaddr(tl_pte_virt)) {
-            tl_pte += 8;
-            continue;
-        }
-
-        uint64_t tl_pg_table_entry = read_ulonglong(tl_pte_virt, "tl_pg_table_entry");
+        uint64_t tl_pg_table_entry = read_pte_entry(tl_pte, "tl_pg_table_entry");
 
         if (tl_pg_table_entry == 0) {
             add_flat_mapping(tmp_mapping, fl_index, sl_index, tl_index, 0,
@@ -449,19 +445,12 @@ std::map<uint64_t, FlatMapping> AArch64PTParser::create_flat_mappings(ulong pg_t
         }
 
         for (int sl_index = 0; sl_index < NUM_SL_PTE; ++sl_index) {
-            ulong sl_pte_virt;
+            uint64_t sl_pg_table_entry;
             if (skip_fl == 0) {
-                sl_pte_virt = phy_to_virt(sl_pte);
+                sl_pg_table_entry = read_pte_entry(sl_pte, "sl_pg_table_entry");
             } else {
-                sl_pte_virt = sl_pte;
+                sl_pg_table_entry = read_pte_entry(sl_pte, "sl_pg_table_entry");
             }
-
-            if (!is_kvaddr(sl_pte_virt)) {
-                sl_pte += 8;
-                continue;
-            }
-
-            uint64_t sl_pg_table_entry = read_ulonglong(sl_pte_virt, "sl_pg_table_entry");
 
             if (sl_pg_table_entry == 0) {
                 add_flat_mapping(tmp_mapping, fl_index, sl_index, 0, 0,
@@ -498,37 +487,91 @@ std::map<uint64_t, FlatMapping> AArch64PTParser::create_flat_mappings(ulong pg_t
 /**
  * Parse and print AArch64 page tables
  */
-void AArch64PTParser::parse_and_print_tables(ulong pg_table, uint level, const std::string& client_name) {
+void AArch64PTParser::parse_and_print_tables(ulong pg_table, uint level, const std::string& client_name, PageTableType type) {
     PRINT("Client: %s\n", client_name.c_str());
     PRINT("TTBR0: 0x%lx\n", pg_table);
     PRINT("Levels: %u\n", level);
+    PRINT("Type: %s\n", (type == PROCESS_PAGE_TABLE) ? "Process Page Table" : "IOMMU Page Table");
 
-    PRINT("[VA Start -- VA End  ] [Size      ] [PA Start   -- PA End  ] "
-                    "[Attributes][Page Table Entry Size] [Memory Type] "
-                    "[Shareability] [Non-Executable] \n");
+    PRINT("%-34s %-12s %-34s %-11s%-6s %-13s %-17s %s\n",
+          "[VA Start -- VA End  ]", "[Size      ]", "[PA Start   -- PA End  ]",
+          "[Attributes]", "[Size]", "[Memory Type]", "[Shareability]", "[Non-Executable]");
 
     if (pg_table == 0) {
         PRINT("No Page Table Found. (Probably a secure domain)\n");
         return;
     }
 
+    // Add debug output for page table parsing
+    LOGD("Starting page table parsing: pg_table=0x%lx, level=%u, type=%s\n",
+         pg_table, level, (type == PROCESS_PAGE_TABLE) ? "PROCESS" : "IOMMU");
+
+    // Store page table type for use in helper functions
+    current_page_table_type = type;
+
+    // Test address accessibility based on page table type
+    if (type == IOMMU_PAGE_TABLE) {
+        // For IOMMU page tables, use phy_to_virt conversion
+        ulong pg_table_virt = phy_to_virt(pg_table);
+        LOGD("IOMMU: phy_to_virt(0x%lx) = 0x%lx, is_kvaddr=%s\n",
+             pg_table, pg_table_virt, is_kvaddr(pg_table_virt) ? "true" : "false");
+
+        if (!is_kvaddr(pg_table_virt)) {
+            PRINT("ERROR: Cannot convert IOMMU page table physical address 0x%lx to virtual address\n", pg_table);
+            return;
+        }
+    } else {
+        // For process page tables, try direct physical memory access
+        LOGD("PROCESS: Using direct physical memory access for 0x%lx\n", pg_table);
+
+        // Test if we can read from the physical address directly
+        uint64_t test_entry = 0;
+        if (!readmem(pg_table, PHYSADDR, &test_entry, sizeof(test_entry), (char*)"test_entry", RETURN_ON_ERROR)) {
+            PRINT("ERROR: Cannot read from process page table physical address 0x%lx\n", pg_table);
+            PRINT("This might indicate the page table is not accessible or corrupted\n");
+            return;
+        }
+        LOGD("PROCESS: Successfully read test entry 0x%lx from physical address\n", test_entry);
+    }
+
     std::map<uint64_t, FlatMapping> flat_mapping = create_flat_mappings(pg_table, level);
+    LOGD("Created %zu flat mappings\n", flat_mapping.size());
+
+    if (flat_mapping.empty()) {
+        PRINT("No page table entries found. Possible causes:\n");
+        PRINT("  1. Page table is empty (process has no mappings)\n");
+        PRINT("  2. Address translation failed\n");
+        PRINT("  3. Page table level detection is incorrect\n");
+        PRINT("  4. Physical memory access failed\n");
+        return;
+    }
+
     std::map<uint64_t, CollapsedMapping> collapsed_mapping = create_collapsed_mapping(flat_mapping);
+    LOGD("Created %zu collapsed mappings\n", collapsed_mapping.size());
 
     for (const auto& pair : collapsed_mapping) {
         const CollapsedMapping& mapping = pair.second;
 
+        char va_range[64], size_str[32], pa_range[64];
+        char attr_str[16], size_tag[16], mem_type[32], share_str[32], exec_str[16];
+
         if (mapping.mapped) {
-            PRINT("0x%016lx--0x%016lx [0x%lx] A:0x%016lx--0x%016lx [0x%lx] %s[%s] [%s] [%s] [%s]\n",
-                    mapping.virt_start, mapping.virt_end, mapping.map_size,
-                    mapping.phys_start, mapping.phys_end, mapping.map_size,
-                    mapping.map_type.c_str(), get_order_string(mapping.map_size).c_str(),
-                    mapping.attr_indx_str.c_str(), mapping.shareability_str.c_str(),
-                    mapping.execute_never_str.c_str());
+            snprintf(va_range, sizeof(va_range), "0x%016lx--0x%016lx", mapping.virt_start, mapping.virt_end);
+            snprintf(size_str, sizeof(size_str), "[0x%-10lx]", mapping.map_size);
+            snprintf(pa_range, sizeof(pa_range), "A:0x%016lx--0x%016lx", mapping.phys_start, mapping.phys_end);
+            snprintf(attr_str, sizeof(attr_str), "%s", mapping.map_type.c_str());
+            snprintf(size_tag, sizeof(size_tag), "[%-4s]", get_order_string(mapping.map_size).c_str());
+            snprintf(mem_type, sizeof(mem_type), "[%s]", mapping.attr_indx_str.c_str());
+            snprintf(share_str, sizeof(share_str), "[%s]", mapping.shareability_str.c_str());
+            snprintf(exec_str, sizeof(exec_str), "[%s]", mapping.execute_never_str.c_str());
+
+            PRINT("%-34s %-12s %-34s %-11s%-6s %-13s %-17s %s\n",
+                    va_range, size_str, pa_range, attr_str, size_tag, mem_type, share_str, exec_str);
         } else {
-            PRINT("0x%016lx--0x%016lx [0x%lx] [UNMAPPED]\n",
-                    mapping.virt_start, mapping.virt_end,
-                    mapping.virt_end - mapping.virt_start + 1);
+            snprintf(va_range, sizeof(va_range), "0x%016lx--0x%016lx", mapping.virt_start, mapping.virt_end);
+            snprintf(size_str, sizeof(size_str), "[0x%-10lx]", mapping.virt_end - mapping.virt_start + 1);
+
+            PRINT("%-34s %-12s [UNMAPPED]\n", va_range, size_str);
         }
     }
 }

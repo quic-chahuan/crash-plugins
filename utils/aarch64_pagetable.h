@@ -13,8 +13,8 @@
  * SPDX-License-Identifier: GPL-2.0-only
  */
 
-#ifndef PAGETABLE_H_
-#define PAGETABLE_H_
+#ifndef ARM64_PAGETABLE_H_
+#define ARM64_PAGETABLE_H_
 
 #include "plugin.h"
 #include <map>
@@ -126,6 +126,14 @@ struct MappingInfo {
 };
 
 /**
+ * Page table type enumeration
+ */
+enum PageTableType {
+    PROCESS_PAGE_TABLE,     // Process page table (requires direct physical memory access)
+    IOMMU_PAGE_TABLE       // IOMMU page table (uses phy_to_virt conversion)
+};
+
+/**
  * ARM64 page table parser utility class
  * Provides methods for parsing and displaying AArch64 page tables
  */
@@ -136,12 +144,25 @@ public:
      * @param pg_table Physical address of the page table base
      * @param level Page table level (3 or 4)
      * @param client_name Name of the client/domain
+     * @param type Page table type (process or IOMMU)
      */
-    void parse_and_print_tables(ulong pg_table, uint level, const std::string& client_name);
+    void parse_and_print_tables(ulong pg_table, uint level, const std::string& client_name,
+                               PageTableType type = IOMMU_PAGE_TABLE);
     void init_offset(void) override;
     void init_command(void) override;
     void cmd_main(void) override;
 private:
+    // Current page table type for address translation
+    PageTableType current_page_table_type = IOMMU_PAGE_TABLE;
+
+    /**
+     * Read 64-bit value from physical or virtual address based on page table type
+     * @param addr Physical address to read from
+     * @param desc Description for error messages
+     * @return 64-bit value read from memory
+     */
+    uint64_t read_pte_entry(ulong addr, const char* desc);
+
     /**
      * Create flat mappings from page table
      * @param pg_table Physical address of the page table base
@@ -258,4 +279,4 @@ private:
     static std::string get_order_string(uint64_t size);
 };
 
-#endif // PAGETABLE_H_
+#endif // ARM64_PAGETABLE_H_

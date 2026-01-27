@@ -67,7 +67,6 @@ list(APPEND PLUGIN_SOURCES
     plugins.cpp
     logger/logger.cpp
     utils/utask.cpp
-    utils/aarch64_pagetable.cpp
     lib/lzo/lzo1x_decompress_safe.c
     lib/lz4/lz4_decompress.c
     binder/binder.cpp
@@ -130,16 +129,19 @@ list(APPEND PLUGIN_SOURCES
     systemd/journal.cpp
     iommu/iommu.cpp
     t32/t32.cpp
-    lockdep/lockdep.cpp)
+    lockdep/lockdep.cpp
+    pagetable/pagetable.cpp)
 
 add_library(plugins SHARED ${PLUGIN_SOURCES})
 if (CMAKE_BUILD_TARGET_ARCH STREQUAL "arm64")
     target_sources(plugins PRIVATE
         coredump/arm/arm64.cpp
-        coredump/arm/compat.cpp)
+        coredump/arm/compat.cpp
+        utils/aarch64_pagetable.cpp)
 elseif (CMAKE_BUILD_TARGET_ARCH STREQUAL "arm")
     target_sources(plugins PRIVATE
-        coredump/arm/arm.cpp)
+        coredump/arm/arm.cpp
+        utils/lpae_pagetable.cpp)
 endif()
 
 set_target_properties(plugins PROPERTIES PREFIX "")
