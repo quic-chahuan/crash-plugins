@@ -201,11 +201,22 @@ private:
     std::vector<ulong> get_disk_by_block_device();
     std::vector<ulong> get_disk_by_bdevmap();
     ulong find_vfsmount_by_superblock(ulong dentry);
+    std::string repeat_str(const std::string& token, size_t n) const;
+    std::string pad_cell(const std::string& value, size_t width, bool right_align) const;
+    std::string center_text(const std::string& value, size_t width) const;
 
 protected:
     static constexpr double KB = 1024.0;
     static constexpr double MB = 1024.0 * 1024.0;
     static constexpr double GB = 1024.0 * 1024.0 * 1024.0;
+    bool is_valid_cpu(int cpu) const;
+    std::string task_state_display(ulong task) const;
+    std::string build_box_table(const std::string& title,
+                                const std::vector<std::string>& headers,
+                                const std::vector<std::vector<std::string>>& rows,
+                                const std::vector<bool>& right_align_cols,
+                                const std::string& footer = std::string(),
+                                bool separate_rows = false) const;
     std::unordered_map<std::string, std::unique_ptr<Typeinfo>> typetable;
 
 public:
@@ -265,7 +276,6 @@ public:
     std::vector<ulong> for_each_misc_dev();
     std::vector<ulong> for_each_bdev();
     std::vector<ulong> for_each_bus();
-
     std::vector<std::shared_ptr<bus_type>> for_each_bus_type();
     std::vector<std::shared_ptr<class_type>> for_each_class_type();
     std::vector<ulong> for_each_class();
