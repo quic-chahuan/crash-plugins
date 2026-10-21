@@ -131,6 +131,7 @@ list(APPEND PLUGIN_SOURCES
     iommu/iommu.cpp
     t32/t32.cpp
     lockdep/lockdep.cpp
+    lockdep/lock_decoder.cpp
     timer/timer.cpp
     )
 
@@ -390,7 +391,8 @@ add_plugin(t32
 
 # =================== build lockdep ===================
 add_plugin(lockdep
-    lockdep/lockdep.cpp)
+    lockdep/lockdep.cpp
+    lockdep/lock_decoder.cpp)
 
 # =================== build timer ===================
 add_plugin(timer
